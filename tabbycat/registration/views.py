@@ -209,7 +209,7 @@ class BaseCreateTeamFormView(LogActionMixin, PublicTournamentPageMixin, CustomQu
 
     @staticmethod
     def _alphabetical_reference(team, speakers=None):
-        teams = team.tournament.team_set.filter(institution=team.institution, reference__regex=r"^[A-Z]+$").values_list('reference', flat=True)
+        teams = Team.objects.all_with_unconfirmed.filter(tournament=team.tournament, institution=team.institution, reference__regex=r"^[A-Z]+$").values_list('reference', flat=True)
         team_numbers = []
         for existing_team in teams:
             n = 0
@@ -227,7 +227,7 @@ class BaseCreateTeamFormView(LogActionMixin, PublicTournamentPageMixin, CustomQu
 
     @staticmethod
     def _numerical_reference(team, speakers=None):
-        teams = team.tournament.team_set.filter(institution=team.institution, reference__regex=r"^\d+$").values_list('reference', flat=True)
+        teams = Team.objects.all_with_unconfirmed.filter(tournament=team.tournament, institution=team.institution, reference__regex=r"^\d+$").values_list('reference', flat=True)
         team_numbers = [int(t) for t in teams]
         return str(max(team_numbers) + 1)
 
@@ -345,7 +345,7 @@ class CreateSpeakerFormView(LogActionMixin, PublicTournamentPageMixin, CustomQue
 
     @property
     def team(self):
-        return self.tournament.team_set.get(pk=self.kwargs['pk'])
+        return Team.objects.all_with_unconfirmed.get(tournament=self.tournament, pk=self.kwargs['pk'])
 
     @property
     def key(self):
@@ -356,7 +356,7 @@ class CreateSpeakerFormView(LogActionMixin, PublicTournamentPageMixin, CustomQue
 
     def is_page_enabled(self, tournament):
         if self.key:
-            team = tournament.team_set.prefetch_related('speaker_set').filter(pk=self.kwargs['pk']).first()
+            team = Team.objects.all_with_unconfirmed.prefetch_related('speaker_set').filter(tournament=tournament, pk=self.kwargs['pk']).first()
             return (
                 tournament.pref('institution_participant_registration') and
                 Invitation.objects.filter(tournament=tournament, for_content_type=ContentType.objects.get_for_model(Speaker), team=team, url_key=self.key).count() == 1 and
@@ -392,7 +392,7 @@ class InstitutionalLandingPageView(TournamentMixin, InstitutionalRegistrationMix
     template_name = 'coach_private_url.html'
 
     def get_adj_table(self):
-        adjudicators = self.tournament.adjudicator_set.filter(institution=self.institution)
+        adjudicators = Adjudicator.objects.all_with_unconfirmed.filter(tournament=self.tournament, institution=self.institution)
 
         table = TabbycatTableBuilder(view=self, title=_('Adjudicators'), sort_key='name')
         table.add_adjudicator_columns(adjudicators, show_institutions=False, show_metadata=False)
@@ -400,7 +400,7 @@ class InstitutionalLandingPageView(TournamentMixin, InstitutionalRegistrationMix
         return table
 
     def get_team_table(self):
-        teams = self.tournament.team_set.filter(institution=self.institution)
+        teams = Team.objects.all_with_unconfirmed.filter(tournament=self.tournament, institution=self.institution)
         table = TabbycatTableBuilder(view=self, title=_('Teams'), sort_key='name')
         table.add_team_columns(teams)
 
@@ -522,8 +522,8 @@ class InstitutionRegistrationTableView(TournamentMixin, AdministratorMixin, VueT
             teams_requested=Sum('teams_requested'),
             teams_allocated=Sum('teams_allocated'),
         ))
-        kwargs['adjs_registered'] = self.tournament.adjudicator_set.filter(institution__isnull=False, adj_core=False, independent=False).count()
-        kwargs['teams_registered'] = self.tournament.team_set.filter(institution__isnull=False).count()
+        kwargs['adjs_registered'] = Adjudicator.objects.all_with_unconfirmed.filter(tournament=self.tournament, institution__isnull=False, adj_core=False, independent=False).count()
+        kwargs['teams_registered'] = Team.objects.all_with_unconfirmed.filter(tournament=self.tournament, institution__isnull=False).count()
         return super().get_context_data(**kwargs)
 
 
@@ -541,10 +541,10 @@ class TeamRegistrationTableView(TournamentMixin, AdministratorMixin, VueTableTem
             except IndexError:
                 return Speaker()
 
-        teams = self.tournament.team_set.select_related('institution').prefetch_related(
+        teams = Team.objects.all_with_unconfirmed.filter(tournament=self.tournament).select_related('institution').prefetch_related(
             'answers__question',
             Prefetch('speaker_set', queryset=Speaker.objects.prefetch_related('answers__question')),
-        ).all()
+        )
         spk_questions = self.tournament.question_set.filter(for_content_type=ContentType.objects.get_for_model(Speaker)).order_by('seq')
 
         table = TabbycatTableBuilder(view=self, title=_('Responses'), sort_key='team')
@@ -569,7 +569,7 @@ class AdjudicatorRegistrationTableView(TournamentMixin, AdministratorMixin, VueT
     view_permission = Permission.VIEW_REGISTRATION
 
     def get_table(self):
-        adjudicators = self.tournament.adjudicator_set.select_related('institution').prefetch_related('answers__question').all()
+        adjudicators = Adjudicator.objects.all_with_unconfirmed.filter(tournament=self.tournament).select_related('institution').prefetch_related('answers__question')
 
         table = TabbycatTableBuilder(view=self, title=_('Responses'), sort_key='name')
         table.add_adjudicator_columns(adjudicators, show_metadata=False)
