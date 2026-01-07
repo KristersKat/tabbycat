@@ -589,6 +589,7 @@ class Round(models.Model):
 
     @property
     def motions_released(self):
+        """Returns True if motions are released (not just info slides)."""
         return self.motions_status == self.MotionsStatus.MOTIONS_RELEASED
 
     @property

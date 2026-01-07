@@ -165,6 +165,11 @@ class BaseReleaseMotionsView(AdministratorMixin, LogActionMixin, RoundMixin, Pos
 
     round_redirect_pattern_name = 'draw-display'
 
+    @property
+    def motions_released(self):
+        """Returns True if motions are being released (not just info slides)."""
+        return self.motions_status == Round.MotionsStatus.MOTIONS_RELEASED
+
     def post(self, request, *args, **kwargs):
         round = self.round
         round.motions_status = self.motions_status
