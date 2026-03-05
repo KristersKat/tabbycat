@@ -35,7 +35,7 @@ from results.models import BallotSubmission, ScoreCriterion, SpeakerScore, Submi
 from results.result import DebateResult, ResultError
 from standings.speakers import SpeakerStandingsGenerator
 from standings.teams import TeamStandingsGenerator
-from tournaments.models import Round, Tournament
+from tournaments.models import Round, ScheduleEvent, Tournament
 from users.models import Group, Membership, UserPermission
 from users.permissions import has_permission, Permission
 from utils.misc import get_ip_address
@@ -212,6 +212,9 @@ class TournamentSerializer(serializers.ModelSerializer):
             lookup_field='slug', lookup_url_kwarg='tournament_slug')
         preferences = serializers.HyperlinkedIdentityField(
             view_name='tournamentpreferencemodel-list',
+            lookup_field='slug', lookup_url_kwarg='tournament_slug')
+        schedule_events = serializers.HyperlinkedIdentityField(
+            view_name='api-scheduleevent-list',
             lookup_field='slug', lookup_url_kwarg='tournament_slug')
 
     _links = TournamentLinksSerializer(source='*', read_only=True)
@@ -1063,6 +1066,22 @@ class VenueCategorySerializer(serializers.ModelSerializer):
         exclude = ('tournament',)
 
 
+class ScheduleEventSerializer(serializers.ModelSerializer):
+    url = fields.TournamentHyperlinkedIdentityField(view_name='api-scheduleevent-detail')
+    round = fields.TournamentHyperlinkedRelatedField(
+        view_name='api-round-detail',
+        lookup_field='seq',
+        lookup_url_kwarg='round_seq',
+        queryset=Round.objects.all(),
+        allow_null=True,
+        required=False,
+    )
+
+    class Meta:
+        model = ScheduleEvent
+        exclude = ('tournament',)
+
+
 def get_metrics_field_type(generator):
     return {
         'type': 'array',
@@ -1110,6 +1129,43 @@ class SpeakerStandingsSerializer(BaseStandingsSerializer):
         return super().get_metrics(obj)
 
 
+class AdjudicatorStandingsRoundSerializer(serializers.Serializer):
+    """One round's score in adjudicator standings."""
+    round = fields.TournamentHyperlinkedRelatedField(
+        view_name='api-round-detail',
+        lookup_field='seq', lookup_url_kwarg='round_seq',
+        queryset=Round.objects.all(),
+        source='debate.round',
+    )
+    type = serializers.ChoiceField(choices=DebateAdjudicator.TYPE_CHOICES)
+    score = serializers.FloatField()
+
+
+class AdjudicatorStandingsSerializer(serializers.Serializer):
+    """Adjudicator standings with per-round scores. Field visibility for public is conditioned on adjudicators_tab_released and adjudicators_tab_shows."""
+    adjudicator = fields.TournamentHyperlinkedRelatedField(
+        view_name='api-adjudicator-detail',
+        queryset=Adjudicator.objects.all(),
+        source='*',
+    )
+    rounds = AdjudicatorStandingsRoundSerializer(many=True, source='debateadjudicator_set')
+    base_score = serializers.FloatField()
+    final_score = serializers.FloatField()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not is_staff(kwargs.get('context')):
+            t = kwargs['context']['tournament']
+            with_permission = partial(has_permission, user=kwargs['context']['request'].user, tournament=kwargs['context']['tournament'])
+            if not with_permission(permission=Permission.VIEW_FEEDBACK_OVERVIEW):
+                if t.pref('adjudicators_tab_shows') == 'test':
+                    self.fields.pop('rounds')
+                    self.fields.pop('final_score')
+                if t.pref('adjudicators_tab_shows') == 'final':
+                    self.fields.pop('rounds')
+                    self.fields.pop('base_score')
+
+
 class DebateAdjudicatorSerializer(serializers.Serializer):
     adjudicators = Adjudicator.objects.all()
     chair = fields.TournamentHyperlinkedRelatedField(view_name='api-adjudicator-detail', queryset=adjudicators)
@@ -1151,6 +1207,9 @@ class RoundPairingSerializer(serializers.ModelSerializer):
     class PairingLinksSerializer(serializers.Serializer):
         ballots = fields.RoundHyperlinkedIdentityField(
             view_name='api-ballot-list',
+            lookup_field='pk', lookup_url_kwarg='debate_pk')
+        checkin = fields.RoundHyperlinkedIdentityField(
+            view_name='api-debate-checkin',
             lookup_field='pk', lookup_url_kwarg='debate_pk')
 
     url = fields.RoundHyperlinkedIdentityField(view_name='api-pairing-detail', lookup_url_kwarg='debate_pk')

@@ -6,7 +6,8 @@ from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.contenttypes.models import ContentType
-from django.db.models import Count, Prefetch, Q
+from django.db.models import Avg, Count, Prefetch, Q
+from django.db.models.functions import Coalesce
 from drf_spectacular.utils import extend_schema, extend_schema_view, OpenApiParameter
 from dynamic_preferences.api.serializers import PreferenceSerializer
 from dynamic_preferences.api.viewsets import PerInstancePreferenceViewSet
@@ -14,7 +15,7 @@ from push_notifications.api.rest_framework import WebPushDeviceViewSet as BaseWe
 from rest_framework.authentication import SessionAuthentication, TokenAuthentication
 from rest_framework.exceptions import NotFound, PermissionDenied
 from rest_framework.fields import DateTimeField
-from rest_framework.generics import CreateAPIView, GenericAPIView, get_object_or_404, RetrieveUpdateAPIView
+from rest_framework.generics import CreateAPIView, GenericAPIView, get_object_or_404, ListAPIView, RetrieveUpdateAPIView
 from rest_framework.mixins import ListModelMixin
 from rest_framework.permissions import BasePermission, IsAdminUser
 from rest_framework.response import Response
@@ -23,8 +24,9 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from actionlog.models import ActionLogEntry
-from adjallocation.models import PreformedPanel
+from adjallocation.models import DebateAdjudicator, PreformedPanel
 from adjallocation.preformed.anticipated import calculate_anticipated_draw
+from adjfeedback.models import AdjudicatorFeedback
 from availability.models import RoundAvailability
 from breakqual.models import BreakCategory
 from breakqual.views import GenerateBreakMixin
@@ -331,7 +333,7 @@ class BreakingTeamsView(TournamentAPIMixin, TournamentPublicAPIMixin, GenerateBr
     @extend_schema(summary="Generate break")
     def create(self, request, *args, **kwargs):
         self.generate_break((self.break_category,))
-        self.log_action(type=ActionLogEntry.ActionType.BREAK_GENERATE_ONE)
+        self.log_action(type=ActionLogEntry.ActionType.BREAK_GENERATE_ONE, agent=ActionLogEntry.Agent.API)
         return self.list(request, *args, **kwargs)
 
     @extend_schema(summary="Delete break")
@@ -340,7 +342,7 @@ class BreakingTeamsView(TournamentAPIMixin, TournamentPublicAPIMixin, GenerateBr
         Destroy is normally for a specific instance, now QuerySet.
         """
         self.filter_queryset(self.get_queryset()).delete()
-        self.log_action(type=ActionLogEntry.ActionType.BREAK_DELETE)
+        self.log_action(type=ActionLogEntry.ActionType.BREAK_DELETE, agent=ActionLogEntry.Agent.API)
         return Response(status=204)  # No content
 
     @extend_schema(summary="Update remark and regenerate break")
@@ -423,7 +425,11 @@ class TeamViewSet(TournamentAPIMixin, TournamentPublicAPIMixin, ModelViewSet):
         if not self.request.user or not self.request.user.is_staff:
             category_prefetch.queryset = category_prefetch.queryset.filter(public=True)
 
-        return super().get_queryset().select_related('tournament').prefetch_related(
+        base_qs = super().get_queryset()
+        if self.request.user.is_staff:
+            base_qs = self.model.objects.all_with_unconfirmed.filter(**self.lookup_kwargs())
+
+        return base_qs.select_related('tournament').prefetch_related(
             Prefetch(
                 'speaker_set',
                 queryset=Speaker.objects.all().prefetch_related('answers__question__tournament', category_prefetch).select_related('team__tournament', 'checkin_identifier'),
@@ -463,11 +469,15 @@ class AdjudicatorViewSet(TournamentAPIMixin, TournamentPublicAPIMixin, ModelView
         params = AdjudicatorParamsSerializer(data=self.request.query_params)
         params.is_valid(raise_exception=True)
 
+        base_qs = super().get_queryset()
+        if self.request.user.is_staff:
+            base_qs = self.model.objects.all_with_unconfirmed.filter(**self.lookup_kwargs())
+
         filters = Q()
         if (breaking := params.validated_data.get('break')) and self.get_break_permission():
             filters &= Q(breaking=breaking)
 
-        return super().get_queryset().select_related('checkin_identifier').prefetch_related(
+        return base_qs.select_related('checkin_identifier').prefetch_related(
             'team_conflicts', 'team_conflicts__tournament',
             'adjudicator_conflicts', 'adjudicator_conflicts__tournament',
             'institution_conflicts', 'venue_constraints__category__tournament',
@@ -590,6 +600,29 @@ class VenueCategoryViewSet(TournamentAPIMixin, PublicAPIMixin, ModelViewSet):
             Prefetch('venues', queryset=Venue.objects.select_related('tournament').filter(tournament__isnull=False)))
 
 
+@extend_schema(tags=['schedule'], parameters=[tournament_parameter])
+@extend_schema_view(
+    list=extend_schema(summary="List tournament schedule events"),
+    create=extend_schema(summary="Create schedule event"),
+    retrieve=extend_schema(summary="Get schedule event", parameters=[id_parameter]),
+    update=extend_schema(summary="Update schedule event", parameters=[id_parameter]),
+    partial_update=extend_schema(summary="Patch schedule event", parameters=[id_parameter]),
+    destroy=extend_schema(summary="Delete schedule event", parameters=[id_parameter]),
+)
+class ScheduleEventViewSet(TournamentAPIMixin, PublicAPIMixin, ModelViewSet):
+    serializer_class = serializers.ScheduleEventSerializer
+    action_log_type_created = ActionLogEntry.ActionType.SCHEDULE_EVENT_CREATE
+    action_log_type_updated = ActionLogEntry.ActionType.SCHEDULE_EVENT_EDIT
+
+    list_permission = Permission.VIEW_EVENTS
+    create_permission = Permission.EDIT_EVENTS
+    update_permission = Permission.EDIT_EVENTS
+    destroy_permission = Permission.EDIT_EVENTS
+
+    def get_queryset(self):
+        return super().get_queryset().select_related('tournament', 'round').order_by('start_time')
+
+
 @extend_schema(tags=['checkins'], parameters=[tournament_parameter, id_parameter])
 class BaseCheckinsView(AdministratorAPIMixin, TournamentAPIMixin, APIView):
     name = "Check-ins"
@@ -638,11 +671,15 @@ class BaseCheckinsView(AdministratorAPIMixin, TournamentAPIMixin, APIView):
         })
         return checkin
 
+    def get_object_kwargs(self, obj):
+        lookup_url_kwarg = self.lookup_url_kwarg or self.lookup_field
+        return {lookup_url_kwarg: obj.pk}
+
     def get_response_dict(self, request, obj, checked, event, **kwargs):
         return {
             'object': reverse(
                 self.object_api_view,
-                kwargs={'tournament_slug': self.tournament.slug, 'pk': obj.pk},
+                kwargs={'tournament_slug': self.tournament.slug, **self.get_object_kwargs(obj)},
                 request=request,
                 format=kwargs.get('format'),
             ),
@@ -761,6 +798,30 @@ class VenueCheckinsView(BaseCheckinsView):
     create_permission = Permission.EDIT_ROOM_CHECKIN
     update_permission = Permission.EDIT_ROOM_CHECKIN
     destroy_permission = Permission.EDIT_ROOM_CHECKIN
+
+
+@extend_schema(tags=['debates'])
+@extend_schema_view(
+    get=extend_schema(summary="Get debate checkin status"),
+    delete=extend_schema(summary="Check out debate"),
+    put=extend_schema(summary="Check in debate"),
+    patch=extend_schema(summary="Toggle debate checkin status"),
+    post=extend_schema(summary="Create debate checkin identifier"),
+)
+class DebateCheckinsView(BaseCheckinsView):
+    model = Debate
+    object_api_view = 'api-pairing-detail'
+    window_preference_pref = False
+    tournament_field = 'round__tournament'
+    lookup_url_kwarg = 'debate_pk'
+    lookup_field = 'pk'
+
+    create_permission = Permission.EDIT_DEBATE_CHECKIN
+    update_permission = Permission.EDIT_DEBATE_CHECKIN
+    destroy_permission = Permission.EDIT_DEBATE_CHECKIN
+
+    def get_object_kwargs(self, obj):
+        return {'debate_pk': obj.pk, 'round_seq': obj.round.seq}
 
 
 def get_metrics_params(generator):
@@ -907,6 +968,44 @@ class TeamStandingsView(BaseStandingsView):
         return super().get_queryset()
 
 
+@extend_schema(tags=['standings'], parameters=[tournament_parameter])
+@extend_schema_view(
+    get=extend_schema(
+        summary="Get adjudicator standings",
+        responses=serializers.AdjudicatorStandingsSerializer(many=True),
+    ),
+)
+class AdjudicatorStandingsView(TournamentAPIMixin, TournamentPublicAPIMixin, ListAPIView):
+    """List adjudicator standings (base score, final weighted score, per-round scores). Public field visibility is conditioned on adjudicators_tab_released and adjudicators_tab_shows."""
+    serializer_class = serializers.AdjudicatorStandingsSerializer
+    access_preference = 'adjudicators_tab_released'
+    list_permission = Permission.VIEW_FEEDBACK_OVERVIEW
+
+    def get_queryset(self):
+        feedback_weight = self.tournament.current_round.feedback_weight
+        adjs = self.tournament.adjudicator_set.select_related('tournament').prefetch_related(
+            'debateadjudicator_set__debate__round__tournament',
+        ).all()
+        feedback_scores = dict(
+            AdjudicatorFeedback.objects.filter(
+                adjudicator__in=adjs, confirmed=True, ignored=False,
+            ).exclude(source_adjudicator__type=DebateAdjudicator.TYPE_TRAINEE).values('adjudicator_id').annotate(avg=Avg('score')),
+        )
+        round_feedback = {
+            (fb['adjudicator_id'], fb['round_id']): fb['avg_score']
+            for fb in AdjudicatorFeedback.objects.filter(
+                adjudicator__in=adjs, confirmed=True, ignored=False,
+            ).exclude(source_adjudicator__type=DebateAdjudicator.TYPE_TRAINEE).annotate(
+                round_id=Coalesce("source_adjudicator__debate__round_id", "source_team__debate__round_id"),
+            ).values('adjudicator_id', 'round_id').annotate(avg_score=Avg('score'))
+        }
+        for adj in adjs:
+            adj.final_score = adj.base_score * (1 - feedback_weight) + (feedback_weight * feedback_scores.get(adj.pk, 0))
+            for d_adj in adj.debateadjudicator_set.all():
+                d_adj.score = round_feedback.get((adj.pk, d_adj.debate.round_id))
+        return adjs
+
+
 @extend_schema(tags=['standings'], parameters=[
     tournament_parameter,
     OpenApiParameter('replies', description='Whether to include reply speeches', required=False, type=bool, default=False),
@@ -1038,7 +1137,7 @@ class PairingViewSet(RoundAPIMixin, ModelViewSet):
     @extend_schema(summary="Delete all pairings in the round")
     def delete_all(self, request, *args, **kwargs):
         self.get_queryset().delete()
-        self.log_action(ActionLogEntry.ActionType.DRAW_REGENERATE)
+        self.log_action(type=ActionLogEntry.ActionType.DRAW_REGENERATE, agent=ActionLogEntry.Agent.API)
         return Response(status=204)  # No content
 
 
@@ -1158,7 +1257,7 @@ class BallotViewSet(RoundAPIMixin, TournamentPublicAPIMixin, ModelViewSet):
         instance = self.get_object()
         instance.discarded = True
         instance.save()
-        self.log_action(ActionLogEntry.ActionType.BALLOT_DISCARD)
+        self.log_action(type=ActionLogEntry.ActionType.BALLOT_DISCARD, agent=ActionLogEntry.Agent.API)
         return self.retrieve(request, *args, **kwargs)
 
 
@@ -1364,7 +1463,7 @@ class AvailabilitiesViewSet(RoundAPIMixin, AdministratorAPIMixin, APIView):
 
             RoundAvailability.objects.bulk_create(
                 [RoundAvailability(content_type=contenttype, round=self.round, object_id=id) for id in ids - existing])
-        self.log_action(type=self.action_log_type_updated)
+        self.log_action(type=self.action_log_type_updated, agent=ActionLogEntry.Agent.API)
 
         return self.get(request, *args, **kwargs)
 
@@ -1375,7 +1474,7 @@ class AvailabilitiesViewSet(RoundAPIMixin, AdministratorAPIMixin, APIView):
             contenttype = ContentType.objects.get_for_model(model)
             RoundAvailability.objects.bulk_create(
                 [RoundAvailability(content_type=contenttype, round=self.round, object_id=p.id) for p in participants])
-        self.log_action(type=self.action_log_type_updated)
+        self.log_action(type=self.action_log_type_updated, agent=ActionLogEntry.Agent.API)
         return self.get(request, *args, **kwargs)
 
     @extend_schema(summary="Mark objects as unavailable")
@@ -1387,13 +1486,13 @@ class AvailabilitiesViewSet(RoundAPIMixin, AdministratorAPIMixin, APIView):
                 content_type=contenttype, round=self.round,
                 object_id__in=[p.id for p in participants],
             ).delete()
-        self.log_action(type=self.action_log_type_updated)
+        self.log_action(type=self.action_log_type_updated, agent=ActionLogEntry.Agent.API)
         return self.get(request, *args, **kwargs)
 
     @extend_schema(summary="Delete class of availabilities", parameters=extra_params)
     def delete(self, request, *args, **kwargs):
         self.get_queryset().delete()
-        self.log_action(type=self.action_log_type_updated)
+        self.log_action(type=self.action_log_type_updated, agent=ActionLogEntry.Agent.API)
         return Response(status=204)
 
 
@@ -1426,7 +1525,7 @@ class PreformedPanelViewSet(RoundAPIMixin, AdministratorAPIMixin, ModelViewSet):
     @extend_schema(summary="Delete all preformed panels from round")
     def delete_all(self, request, *args, **kwargs):
         self.get_queryset().delete()
-        self.log_action(ActionLogEntry.ActionType.PREFORMED_PANELS_DELETE)
+        self.log_action(type=ActionLogEntry.ActionType.PREFORMED_PANELS_DELETE, agent=ActionLogEntry.Agent.API)
         return Response(status=204)  # No content
 
     @extend_schema(summary="Add blank preformed panels")
@@ -1438,7 +1537,7 @@ class PreformedPanelViewSet(RoundAPIMixin, AdministratorAPIMixin, ModelViewSet):
                 'bracket_min': bracket_min,
                 'liveness': liveness,
             })
-        self.log_action(self.action_log_type_created)
+        self.log_action(type=self.action_log_type_created, agent=ActionLogEntry.Agent.API)
 
         return self.get(request, *args, **kwargs)
 
