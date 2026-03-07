@@ -584,6 +584,14 @@ class Round(models.Model):
         return self._is_current
 
     @property
+    def motions_released(self):
+        """Backwards-compatible boolean indicating if motions have been released.
+
+        True iff motions_status is MOTIONS_RELEASED. Info-slide-only releases are
+        treated as not released here, matching the historical boolean semantics."""
+        return self.motions_status == self.MotionsStatus.MOTIONS_RELEASED
+
+    @property
     def motions_good_for_public(self):
         return self.motions_status == self.MotionsStatus.MOTIONS_RELEASED or not self.motion_set.exists()
 
